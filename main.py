@@ -137,7 +137,7 @@ def get_db_connection():
 def read_root():
     return {"message": "Art App Backend is Live!"}
 
-# (3) 게시글 업로드 (style1, genre 저장 추가 ✨)
+# (3) 게시글 업로드: 사진 등록 시 모든 AI 데이터 즉시 생성 ✨
 @app.post("/posts/")
 async def create_post(
     user_id: int = Form(...), 
@@ -145,30 +145,58 @@ async def create_post(
     artist_name: Optional[str] = Form("작가 미상"),
     description: Optional[str] = Form(None), 
     tags: Optional[str] = Form(None),
-    genre: Optional[str] = Form(None),
-    style1: Optional[str] = Form(None),
+    genre: Optional[str] = Form("인상주의"), # 기본값 설정
+    style1: Optional[str] = Form("유화"),    # 기본값 설정
     image: UploadFile = File(...)
 ):
+    # 1. 이미지 S3 업로드
     image_url = upload_file_to_s3(image)
-    if not image_url: raise HTTPException(status_code=500, detail="S3 업로드 실패")
+    if not image_url:
+        raise HTTPException(status_code=500, detail="S3 업로드 실패")
 
-    # 업로드 시 음악 프롬프트 자동 생성 시도
+    # 2. ✨ [즉시 실행 1] 그림 분석 (ai_summary 생성)
+    # 사진이 들어오자마자 분석을 돌려서 ai_summary를 확보합니다.
+    ai_summary = None
+    try:
+        print(f"🖼️ [{title}] 그림 분석 중...")
+        vision_res = run_gemini_vision(image_url, title, artist_name, genre, style1)
+        if vision_res:
+            ai_summary = vision_res.get('art_review')
+    except Exception as e:
+        print(f"❌ 그림 분석 실패: {e}")
+
+    # 3. ✨ [즉시 실행 2] 음악 프롬프트 생성 (music_prompt 생성)
+    # 사용자의 설명이 없더라도 위에서 만든 ai_summary를 재료로 사용합니다.
     generated_prompt = None
-    if description or tags:
-        input_ctx = f"설명: {description or ''} / 태그: {tags or ''}"
-        res = run_gemini_music(input_ctx, title, artist_name)
-        if res: generated_prompt = res.get('music_prompt')
+    try:
+        source_text = description or ai_summary or tags or "아름다운 예술 작품"
+        print(f"🎵 [{title}] 음악 프롬프트 생성 중...")
+        music_res = run_gemini_music(f"{source_text} / 태그: {tags or ''}", title, artist_name)
+        if music_res:
+            generated_prompt = music_res.get('music_prompt')
+    except Exception as e:
+        print(f"❌ 음악 프롬프트 생성 실패: {e}")
 
+    # 4. DB 저장: 이제 모든 값이 채워진 상태로 저장됩니다.
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
         sql = """
-            INSERT INTO posts (user_id, title, artist_name, image_url, description, tags, music_prompt, genre, style1)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO posts (user_id, title, artist_name, image_url, description, tags, ai_summary, music_prompt, genre, style1)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
-        cursor.execute(sql, (user_id, title, artist_name, image_url, description, tags, generated_prompt, genre, style1))
+        val = (user_id, title, artist_name, image_url, description, tags, ai_summary, generated_prompt, genre, style1)
+        cursor.execute(sql, val)
         conn.commit()
-        return {"id": cursor.lastrowid, "image_url": image_url, "music_prompt": generated_prompt}
+        
+        return {
+            "message": "등록 및 AI 분석 완료",
+            "id": cursor.lastrowid,
+            "ai_summary": ai_summary,
+            "music_prompt": generated_prompt
+        }
+    except mysql.connector.Error as err:
+        raise HTTPException(status_code=400, detail=f"DB 저장 실패: {err}")
     finally:
         cursor.close(); conn.close()
 
