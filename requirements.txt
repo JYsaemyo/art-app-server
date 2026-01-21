@@ -9,3 +9,4 @@ google-generativeai
 openai
 requests
 Pillow
+pydantic
