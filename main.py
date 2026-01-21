@@ -282,3 +282,67 @@ def sync_missing_ai_data():
         return {"message": f"{sync_count}건 보정 완료"}
     finally:
         cursor.close(); conn.close()
+
+import asyncio
+
+# --- [추가] 서버 시작 시 실행될 백그라운드 동기화 함수 ---
+async def startup_sync():
+    """서버 시작 5초 후부터 비어있는 AI 데이터를 자동으로 채웁니다."""
+    await asyncio.sleep(5) # 서버가 완전히 준비될 때까지 잠시 대기
+    print("🚀 [System] 서버 시작: 누락된 AI 데이터 자동 보정을 시작합니다...")
+    
+    try:
+        # 기존에 만든 sync_missing_ai_data 로직을 그대로 호출하거나 
+        # 아래처럼 직접 로직을 수행합니다.
+        conn = get_db_connection()
+        cursor = conn.cursor(dictionary=True)
+        
+        # 보정이 필요한 데이터 조회
+        cursor.execute("SELECT * FROM posts WHERE ai_summary IS NULL OR music_prompt IS NULL")
+        empty_posts = cursor.fetchall()
+
+        if not empty_posts:
+            print("✅ [System] 보정할 데이터가 없습니다. 모든 데이터가 최신입니다.")
+            return
+
+        for post in empty_posts:
+            post_id = post['id']
+            updates = {}
+
+            # 1. ai_summary 보정 (style1 컬럼 활용 ✨)
+            if not post.get('ai_summary'):
+                style = post.get('style1') or "유화"
+                genre = post.get('genre') or "인상주의"
+                res = run_gemini_vision(post['image_url'], post['title'], post['artist_name'], genre, style)
+                if res:
+                    updates['ai_summary'] = res.get('art_review', '')
+                    post['ai_summary'] = updates['ai_summary']
+
+            # 2. music_prompt 보정
+            if not post.get('music_prompt'):
+                source = post.get('description') or post.get('ai_summary')
+                if source:
+                    res = run_gemini_music(f"{source} / {post.get('tags','')}", post['title'], post['artist_name'])
+                    if res:
+                        updates['music_prompt'] = res.get('music_prompt')
+
+            # DB 반영
+            if updates:
+                cols = ", ".join([f"{k} = %s" for k in updates.keys()])
+                cursor.execute(f"UPDATE posts SET {cols} WHERE id = %s", list(updates.values()) + [post_id])
+                conn.commit()
+                print(f"✨ [System] ID {post_id}번 데이터 보정 완료")
+
+        print(f"✅ [System] 총 {len(empty_posts)}건의 데이터 보정 프로세스가 종료되었습니다.")
+
+    except Exception as e:
+        print(f"❌ [System] 자동 보정 중 에러 발생: {e}")
+    finally:
+        if 'cursor' in locals(): cursor.close()
+        if 'conn' in locals(): conn.close()
+
+# --- FastAPI 스타트업 이벤트 등록 ---
+@app.on_event("startup")
+async def on_startup():
+    # 서버 실행 시 백그라운드에서 동기화 함수 실행 (비동기 처리)
+    asyncio.create_task(startup_sync())
