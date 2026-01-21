@@ -2,6 +2,10 @@ fastapi
 uvicorn
 mysql-connector-python
 python-dotenv
-pydantic
-email-validator
+boto3
+python-multipart
+streamlit
+google-generativeai
+openai
 requests
+Pillow
