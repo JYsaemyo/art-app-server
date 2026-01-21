@@ -194,8 +194,8 @@ def analyze_art(post_id: int):
         if not post: raise HTTPException(status_code=404, detail="게시글 없음")
         
         # DB의 style1 컬럼 값을 우선적으로 분석에 사용
-        target_style = post.get('style1') or "유화"
-        target_genre = post.get('genre') or "인상주의"
+        target_style = post.get('style1')
+        target_genre = post.get('genre')
         
         ai_result = run_gemini_vision(post['image_url'], post['title'], post['artist_name'], target_genre, target_style)
         if not ai_result: raise HTTPException(status_code=500, detail="AI 분석 실패")
@@ -311,8 +311,8 @@ async def startup_sync():
 
             # 1. ai_summary 보정 (style1 컬럼 활용 ✨)
             if not post.get('ai_summary'):
-                style = post.get('style1') or "유화"
-                genre = post.get('genre') or "인상주의"
+                style = post.get('style1')
+                genre = post.get('genre')
                 res = run_gemini_vision(post['image_url'], post['title'], post['artist_name'], genre, style)
                 if res:
                     updates['ai_summary'] = res.get('art_review', '')
