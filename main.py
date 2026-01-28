@@ -12,6 +12,7 @@ from PIL import Image
 import google.generativeai as genai
 from dotenv import load_dotenv
 from typing import Optional
+import asyncio
 
 # 1. 환경 변수 로드
 load_dotenv()
@@ -49,6 +50,7 @@ def upload_file_to_s3(file: UploadFile):
     try:
         file_extension = file.filename.split(".")[-1]
         unique_filename = f"{uuid.uuid4()}.{file_extension}"
+        
         s3_client.upload_fileobj(
             file.file,
             BUCKET_NAME,
@@ -71,9 +73,10 @@ def load_image_from_url(url):
         print(f"이미지 다운로드 실패: {e}")
         return None
 
-# 🎨 [핵심 수정] 이미지 시각 분석을 최우선으로 하도록 프롬프트 강화
-def run_gemini_vision(image_url, title, artist, genre, styles):
+# 🖼️ [핵심] 이미지 시각 분석을 최우선으로 하도록 프롬프트 강화
+def run_gemini_vision(image_url, title, artist, genre, style):
     """
+    style: style1 단일 문자열 값
     이미지 자체의 시각적 특징을 텍스트 정보(장르, 스타일)와 결합하여 분석합니다.
     """
     img = load_image_from_url(image_url)
@@ -81,22 +84,25 @@ def run_gemini_vision(image_url, title, artist, genre, styles):
     
     model = genai.GenerativeModel('models/gemini-2.0-flash')
     
-    # 1. 스타일 정보 정리
-    valid_styles = [s for s in styles if s]
-    style_text = ", ".join(valid_styles) if valid_styles else "특별히 지정되지 않음"
+    # 1. 스타일 텍스트 처리
+    style_text = style if style else "특별히 지정되지 않음"
 
     # 2. 장르에 따른 분석 초점 설정 (이미지 관찰 중심)
-    if genre in ["그림", "조각", "Painting", "Sculpture", "유화", "수채화", "동양화"]:
-        # [Case A] 그림/조각: 이미지에서 화풍의 증거를 찾아라
+    if genre in ["그림", "조각", "Painting", "Sculpture", "유화", "수채화", "동양화", "드로잉"]:
+        # [Case A] 그림/조각: style1 정보를 집중적으로 확인
         prompt_context = f"""
-        이 작품의 장르는 '{genre}'이며, 주요 화풍/스타일은 [{style_text}]입니다.
-        **반드시 제공된 이미지에서** 이러한 화풍이 드러나는 시각적 증거(예: 붓터치의 질감, 색채 사용 방식, 조각의 재료적 특성, 입체감 표현 등)를 찾아내어 묘사하고, 그것이 텍스트로 제공된 스타일 정보와 어떻게 일치하는지 설명하세요.
+        이 작품의 장르는 '{genre}'이며, 핵심 화풍(Style)은 '{style_text}'입니다.
+        
+        **[중요] 반드시 제공된 이미지(사진)를 시각적으로 분석하세요.**
+        이미지 속의 붓터치, 질감, 색채, 조형적 특징이 텍스트로 제시된 화풍 '{style_text}'와 어떻게 일치하는지 시각적 근거를 들어 설명하세요.
+        만약 텍스트 정보와 이미지가 다르다면, 이미지에서 보이는 실제 특징을 우선하여 묘사하세요.
         """
     else:
         # [Case B] 그 외 (사진, 미디어아트 등): 이미지의 연출과 제목의 관계를 찾아라
         prompt_context = f"""
-        이 작품의 장르는 '{genre}'입니다. 스타일 정보는 부차적입니다.
-        **이미지 속에 나타난** 핵심적인 시각적 연출(구도, 빛의 사용, 피사체의 표현 방식, 분위기 등)을 관찰하고, 이것이 작품의 제목 '{title}'이 주는 의미나 상징성과 어떻게 연결되는지 시각적 근거를 들어 분석하세요.
+        이 작품의 장르는 '{genre}'입니다. 
+        스타일 정보보다는 **이미지 자체의 시각적 연출**과 작품의 제목 '{title}'이 주는 상징성에 집중하여 분석하세요.
+        이미지에서 느껴지는 분위기가 주제를 어떻게 전달하는지 설명하세요.
         """
 
     # 3. 최종 프롬프트 조합 (이미지 분석 강조)
@@ -108,7 +114,8 @@ def run_gemini_vision(image_url, title, artist, genre, styles):
     [작품 텍스트 정보]
     - 제목: {title}
     - 작가: {artist}
-    - 텍스트로 정의된 장르 및 스타일: {genre} / [{style_text}]
+    - 장르: {genre}
+    - 스타일: {style_text}
     
     [분석 지침]
     {prompt_context}
@@ -130,6 +137,7 @@ def run_gemini_vision(image_url, title, artist, genre, styles):
         print(f"Gemini Vision 에러: {e}")
         return None
 
+# 🎵 음악 프롬프트 생성 함수 (필수)
 def run_gemini_music(description, title, artist):
     model = genai.GenerativeModel('models/gemini-2.0-flash')
     prompt = f"""
@@ -177,8 +185,12 @@ async def create_post(
     artist_name: Optional[str] = Form("작가 미상"),
     description: Optional[str] = Form(None), 
     tags: Optional[str] = Form(None),
-    genre: Optional[str] = Form("인상주의"), # 기본값 설정
-    style1: Optional[str] = Form("유화"),    # 기본값 설정
+    genre: Optional[str] = Form("인상주의"), # 기본값
+    style1: Optional[str] = Form("유화"),    # AI 분석에 사용될 주요 스타일
+    style2: Optional[str] = Form(None), 
+    style3: Optional[str] = Form(None), 
+    style4: Optional[str] = Form(None), 
+    style5: Optional[str] = Form(None),
     image: UploadFile = File(...)
 ):
     # 1. 이미지 S3 업로드
@@ -186,11 +198,12 @@ async def create_post(
     if not image_url:
         raise HTTPException(status_code=500, detail="S3 업로드 실패")
 
-    # 2. ✨ [즉시 실행 1] 그림 분석 (ai_summary 생성)
+    # 2. ✨ [즉시 실행 1] 그림 분석 (style1 사용)
     # 사진이 들어오자마자 분석을 돌려서 ai_summary를 확보합니다.
     ai_summary = None
     try:
-        print(f"🖼️ [{title}] 그림 분석 중...")
+        print(f"🖼️ [{title}] 그림 분석 중... (장르: {genre}, 스타일: {style1})")
+        # style1 하나만 넘깁니다.
         vision_res = run_gemini_vision(image_url, title, artist_name, genre, style1)
         if vision_res:
             ai_summary = vision_res.get('art_review')
@@ -209,15 +222,16 @@ async def create_post(
     except Exception as e:
         print(f"❌ 음악 프롬프트 생성 실패: {e}")
 
-    # 4. DB 저장: 이제 모든 값이 채워진 상태로 저장됩니다.
+    # 4. DB 저장: 모든 style 컬럼 저장
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
         sql = """
-            INSERT INTO posts (user_id, title, artist_name, image_url, description, tags, ai_summary, music_prompt, genre, style1)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO posts 
+            (user_id, title, artist_name, image_url, description, tags, ai_summary, music_prompt, genre, style1, style2, style3, style4, style5)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
-        val = (user_id, title, artist_name, image_url, description, tags, ai_summary, generated_prompt, genre, style1)
+        val = (user_id, title, artist_name, image_url, description, tags, ai_summary, generated_prompt, genre, style1, style2, style3, style4, style5)
         cursor.execute(sql, val)
         conn.commit()
         
@@ -232,7 +246,7 @@ async def create_post(
     finally:
         cursor.close(); conn.close()
 
-# (4) 피드 조회
+# (4) 피드 조회: DB 내용만 빠르게 응답
 @app.get("/posts/")
 def get_posts():
     conn = get_db_connection()
@@ -243,7 +257,7 @@ def get_posts():
     finally:
         cursor.close(); conn.close()
 
-# (5) 그림 분석 (style1 적용 ✨)
+# (5) 그림 분석 버튼 클릭 (style1 사용)
 @app.post("/posts/{post_id}/analyze")
 def analyze_art(post_id: int):
     conn = get_db_connection()
@@ -253,22 +267,28 @@ def analyze_art(post_id: int):
         post = cursor.fetchone()
         if not post: raise HTTPException(status_code=404, detail="게시글 없음")
         
-        # DB의 style1 컬럼 값을 우선적으로 분석에 사용
+        # 1. Gemini를 호출하여 분석 수행 (style1 사용)
         target_style = post.get('style1')
         target_genre = post.get('genre')
         
         ai_result = run_gemini_vision(post['image_url'], post['title'], post['artist_name'], target_genre, target_style)
+        
         if not ai_result: raise HTTPException(status_code=500, detail="AI 분석 실패")
 
+        # 2. 결과 저장
         summary_text = ai_result.get('art_review', '')
         cursor.execute("UPDATE posts SET ai_summary = %s WHERE id = %s", (summary_text, post_id))
         conn.commit()
         
-        return {"message": "분석 완료", "ai_summary": summary_text, "result": ai_result}
+        return {
+            "message": "분석 완료 및 저장 성공",
+            "ai_summary": summary_text,
+            "result": ai_result
+        }
     finally:
         cursor.close(); conn.close()
 
-# (6) 음악 프롬프트 수동 생성
+# (6) 음악 프롬프트 수동 요청
 @app.post("/posts/{post_id}/music")
 def generate_music_prompt(post_id: int):
     conn = get_db_connection()
@@ -276,10 +296,15 @@ def generate_music_prompt(post_id: int):
     try:
         cursor.execute("SELECT * FROM posts WHERE id = %s", (post_id,))
         post = cursor.fetchone()
+        
+        # 재료 확인
         desc = post.get('description') or post.get('ai_summary')
-        if not desc: raise HTTPException(status_code=400, detail="정보 부족")
+        if not desc:
+            raise HTTPException(status_code=400, detail="분석 결과나 설명이 없어 프롬프트를 만들 수 없습니다.")
 
-        music_res = run_gemini_music(f"{desc} / {post.get('tags','')}", post['title'], post['artist_name'])
+        tags = post.get('tags') or ""
+        music_res = run_gemini_music(f"{desc} / {tags}", post['title'], post['artist_name'])
+        
         if music_res:
             prompt_text = music_res.get('music_prompt', '')
             cursor.execute("UPDATE posts SET music_prompt = %s WHERE id = %s", (prompt_text, post_id))
@@ -288,7 +313,7 @@ def generate_music_prompt(post_id: int):
     finally:
         cursor.close(); conn.close()
 
-# (7) 음악 URL 등록
+# (7) 음악 URL 등록 API
 class MusicUrlUpdate(BaseModel):
     music_url: str
 
@@ -299,11 +324,11 @@ def register_music_url(post_id: int, body: MusicUrlUpdate):
     try:
         cursor.execute("UPDATE posts SET music_url = %s WHERE id = %s", (body.music_url, post_id))
         conn.commit()
-        return {"message": "등록 완료"}
+        return {"message": "등록 완료", "music_url": body.music_url}
     finally:
         cursor.close(); conn.close()
 
-# (8) 기존 DB 데이터 보정 (비어있는 값 자동 생성)
+# (8) 수동 보정 API
 @app.post("/posts/sync-ai")
 def sync_missing_ai_data():
     conn = get_db_connection()
@@ -311,6 +336,7 @@ def sync_missing_ai_data():
     try:
         cursor.execute("SELECT * FROM posts WHERE ai_summary IS NULL OR music_prompt IS NULL")
         empty_posts = cursor.fetchall()
+
         if not empty_posts: return {"message": "모든 데이터가 최신입니다."}
 
         sync_count = 0
@@ -318,58 +344,55 @@ def sync_missing_ai_data():
             post_id = post['id']
             updates = {}
 
-            # [A] ai_summary 생성 (style1 컬럼 활용 ✨)
+            # [A] ai_summary 채우기 (style1 사용)
             if not post.get('ai_summary'):
                 style = post.get('style1')
                 genre = post.get('genre')
                 res = run_gemini_vision(post['image_url'], post['title'], post['artist_name'], genre, style)
                 if res:
                     updates['ai_summary'] = res.get('art_review', '')
-                    post['ai_summary'] = res.get('art_review') # 다음 단계를 위해 갱신
+                    post['ai_summary'] = updates['ai_summary'] # 임시 갱신
 
-            # [B] music_prompt 생성
+            # [B] music_prompt 채우기
             if not post.get('music_prompt'):
                 source = post.get('description') or post.get('ai_summary')
                 if source:
                     res = run_gemini_music(f"{source} / {post.get('tags','')}", post['title'], post['artist_name'])
-                    if res: updates['music_prompt'] = res.get('music_prompt')
+                    if res:
+                        updates['music_prompt'] = res.get('music_prompt')
 
+            # DB 반영
             if updates:
                 cols = ", ".join([f"{k} = %s" for k in updates.keys()])
                 cursor.execute(f"UPDATE posts SET {cols} WHERE id = %s", list(updates.values()) + [post_id])
                 conn.commit()
                 sync_count += 1
-        return {"message": f"{sync_count}건 보정 완료"}
+
+        return {"message": f"총 {sync_count}건 보정 완료"}
     finally:
         cursor.close(); conn.close()
 
-import asyncio
-
-# --- [추가] 서버 시작 시 실행될 백그라운드 동기화 함수 ---
+# --- [서버 시작 시] 백그라운드 자동 동기화 ---
 async def startup_sync():
     """서버 시작 5초 후부터 비어있는 AI 데이터를 자동으로 채웁니다."""
-    await asyncio.sleep(5) # 서버가 완전히 준비될 때까지 잠시 대기
-    print("🚀 [System] 서버 시작: 누락된 AI 데이터 자동 보정을 시작합니다...")
+    await asyncio.sleep(5)
+    print("🚀 [System] 서버 시작: 누락된 AI 데이터 자동 보정 시작...")
     
     try:
-        # 기존에 만든 sync_missing_ai_data 로직을 그대로 호출하거나 
-        # 아래처럼 직접 로직을 수행합니다.
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
-        
-        # 보정이 필요한 데이터 조회
         cursor.execute("SELECT * FROM posts WHERE ai_summary IS NULL OR music_prompt IS NULL")
         empty_posts = cursor.fetchall()
 
         if not empty_posts:
-            print("✅ [System] 보정할 데이터가 없습니다. 모든 데이터가 최신입니다.")
+            print("✅ [System] 보정할 데이터가 없습니다.")
             return
 
         for post in empty_posts:
             post_id = post['id']
             updates = {}
 
-            # 1. ai_summary 보정 (style1 컬럼 활용 ✨)
+            # 1. ai_summary 보정
             if not post.get('ai_summary'):
                 style = post.get('style1')
                 genre = post.get('genre')
@@ -386,23 +409,19 @@ async def startup_sync():
                     if res:
                         updates['music_prompt'] = res.get('music_prompt')
 
-            # DB 반영
             if updates:
                 cols = ", ".join([f"{k} = %s" for k in updates.keys()])
                 cursor.execute(f"UPDATE posts SET {cols} WHERE id = %s", list(updates.values()) + [post_id])
                 conn.commit()
                 print(f"✨ [System] ID {post_id}번 데이터 보정 완료")
 
-        print(f"✅ [System] 총 {len(empty_posts)}건의 데이터 보정 프로세스가 종료되었습니다.")
-
+        print(f"✅ [System] 총 {len(empty_posts)}건의 데이터 보정 프로세스 종료.")
     except Exception as e:
-        print(f"❌ [System] 자동 보정 중 에러 발생: {e}")
+        print(f"❌ [System] 자동 보정 중 에러: {e}")
     finally:
         if 'cursor' in locals(): cursor.close()
         if 'conn' in locals(): conn.close()
 
-# --- FastAPI 스타트업 이벤트 등록 ---
 @app.on_event("startup")
 async def on_startup():
-    # 서버 실행 시 백그라운드에서 동기화 함수 실행 (비동기 처리)
     asyncio.create_task(startup_sync())
