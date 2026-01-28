@@ -71,27 +71,59 @@ def load_image_from_url(url):
         print(f"이미지 다운로드 실패: {e}")
         return None
 
-# 🖼️ 그림 분석 시 style1 정보를 적극 활용하도록 프롬프트 구성
-def run_gemini_vision(image_url, title, artist, genre, style):
+# 🎨 [핵심 수정] 이미지 시각 분석을 최우선으로 하도록 프롬프트 강화
+def run_gemini_vision(image_url, title, artist, genre, styles):
+    """
+    이미지 자체의 시각적 특징을 텍스트 정보(장르, 스타일)와 결합하여 분석합니다.
+    """
     img = load_image_from_url(image_url)
     if not img: return None
     
     model = genai.GenerativeModel('models/gemini-2.0-flash')
     
-    prompt = f"""
-    당신은 미술 평론가입니다. 제공된 이미지와 아래의 스타일 정보를 바탕으로 작품을 정밀 분석하세요.
-    특별히 지정된 화풍({style})의 특징이 그림에서 어떻게 나타나는지 주목하여 JSON으로 출력하세요.
+    # 1. 스타일 정보 정리
+    valid_styles = [s for s in styles if s]
+    style_text = ", ".join(valid_styles) if valid_styles else "특별히 지정되지 않음"
 
-    [정보] 제목: {title}, 작가: {artist}, 장르: {genre}, 화풍(Style): {style}
+    # 2. 장르에 따른 분석 초점 설정 (이미지 관찰 중심)
+    if genre in ["그림", "조각", "Painting", "Sculpture", "유화", "수채화", "동양화"]:
+        # [Case A] 그림/조각: 이미지에서 화풍의 증거를 찾아라
+        prompt_context = f"""
+        이 작품의 장르는 '{genre}'이며, 주요 화풍/스타일은 [{style_text}]입니다.
+        **반드시 제공된 이미지에서** 이러한 화풍이 드러나는 시각적 증거(예: 붓터치의 질감, 색채 사용 방식, 조각의 재료적 특성, 입체감 표현 등)를 찾아내어 묘사하고, 그것이 텍스트로 제공된 스타일 정보와 어떻게 일치하는지 설명하세요.
+        """
+    else:
+        # [Case B] 그 외 (사진, 미디어아트 등): 이미지의 연출과 제목의 관계를 찾아라
+        prompt_context = f"""
+        이 작품의 장르는 '{genre}'입니다. 스타일 정보는 부차적입니다.
+        **이미지 속에 나타난** 핵심적인 시각적 연출(구도, 빛의 사용, 피사체의 표현 방식, 분위기 등)을 관찰하고, 이것이 작품의 제목 '{title}'이 주는 의미나 상징성과 어떻게 연결되는지 시각적 근거를 들어 분석하세요.
+        """
+
+    # 3. 최종 프롬프트 조합 (이미지 분석 강조)
+    prompt = f"""
+    당신은 예리한 관찰력을 가진 예술 전문 큐레이터입니다. 
     
+    **[가장 중요한 지시]** 텍스트 정보에만 의존하지 말고, **반드시 함께 제공된 이미지(사진)를 면밀히 시각적으로 분석**해야 합니다. 당신의 분석 결과는 실제 눈으로 본 이미지의 특징에 기반해야 합니다.
+
+    [작품 텍스트 정보]
+    - 제목: {title}
+    - 작가: {artist}
+    - 텍스트로 정의된 장르 및 스타일: {genre} / [{style_text}]
+    
+    [분석 지침]
+    {prompt_context}
+
     [출력 포맷 (JSON)]
+    - 모든 설명은 완성된 문장으로 서술하세요.
     {{
-        "artist_intro": "작가 설명 (2문장)",
-        "title_meaning": "제목 의미 (2문장)",
-        "art_review": "화풍의 특징이 반영된 종합 감상평 (3문장)"
+        "artist_intro": "작가 설명 (2문장 내외)",
+        "title_meaning": "제목이 이미지와 어떤 관련이 있는지 설명 (2문장 내외)",
+        "art_review": "이미지의 시각적 특징을 바탕으로 한 종합 감상평 (3문장 내외)"
     }}
     """
+    
     try:
+        # 이미지 객체(img)와 강화된 텍스트 프롬프트(prompt)를 함께 전송
         response = model.generate_content([prompt, img], generation_config={"response_mime_type": "application/json"})
         return json.loads(response.text)
     except Exception as e:
