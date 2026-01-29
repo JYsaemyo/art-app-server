@@ -45,7 +45,7 @@ s3_client = boto3.client(
 BUCKET_NAME = os.getenv("AWS_BUCKET_NAME")
 REGION = os.getenv("AWS_REGION")
 
-# --- Pydantic Models (위치: 사용 전 정의 필수) ---
+# --- Pydantic Models ---
 class MusicUrlUpdate(BaseModel):
     music_url: str
 
@@ -78,39 +78,48 @@ def get_db_connection():
         database=os.getenv("DB_NAME")
     )
 
-# --- AI Core Functions ---
+# --- AI Core Functions (프롬프트 복구 완료) ---
 
-# 1. 그림 분석 (이미지 우선)
+# 1. 그림 분석 (Style Anchor & Evidence Seeking 버전)
 def run_gemini_vision(image_url, title, artist, genre, style):
     img = load_image_from_url(image_url)
     if not img: return None
     model = genai.GenerativeModel('models/gemini-2.0-flash')
     
-    style_text = style if style else "특별히 지정되지 않음"
+    style_text = style if style else "특별히 지정되지 않은 화풍"
     
-    if genre in ["그림", "조각", "Painting", "Sculpture", "유화", "수채화", "동양화", "드로잉"]:
+    # [복구됨] 스타일 집중 분석 프롬프트
+    if genre in ["그림", "조각", "Painting", "Sculpture", "유화", "수채화", "동양화", "드로잉", "일러스트", "판화"]:
         prompt_context = f"""
-        이 작품의 장르는 '{genre}'이며, 텍스트상 화풍은 '{style_text}'입니다.
-        **[필수] 텍스트보다 이미지를 우선하세요.**
-        이미지에서 보이는 붓터치, 질감, 색채, 조형적 특징을 관찰하고, 이것이 화풍 '{style_text}'와 일치하는지 시각적 근거를 들어 설명하세요.
+        이 작품의 장르는 '{genre}'이며, **가장 핵심적인 화풍(Style)은 '{style_text}'**입니다.
+        
+        **[분석 미션: 화풍 입증하기]**
+        당신은 '{style_text}' 전문 비평가입니다. 텍스트 정보에 의존하지 말고, **제공된 이미지(Picture)**에서 '{style_text}' 양식의 시각적 증거를 찾아내세요.
+        
+        1. **화풍의 정의**: 이미지 속 붓터치, 질감, 색채 사용이 '{style_text}'의 전형적인 특징과 어떻게 일치하는지 묘사하세요.
+        2. **기법 분석**: 작가가 이 스타일을 표현하기 위해 사용한 재료적/기법적 시도(거친 마티에르, 빛의 산란 등)를 분석하세요.
+        3. **비평적 관점**: 이 화풍이 작품의 주제를 전달하는 데 어떤 효과를 주는지 평가하세요.
         """
     else:
+        # 그 외 장르
         prompt_context = f"""
-        이 작품의 장르는 '{genre}'입니다.
-        스타일 정보보다는 **이미지 자체의 시각적 연출(구도, 빛, 분위기)**과 제목 '{title}'의 상징적 연결성을 분석하세요.
+        이 작품은 '{genre}' 장르입니다. (스타일 참고: {style_text})
+        스타일보다는 **이미지 자체의 시각적 연출(구도, 빛, 분위기)**과 제목 '{title}'의 상징적 연결성을 분석하세요.
         """
 
     prompt = f"""
-    당신은 예술 전문 큐레이터입니다. 
-    **[가장 중요한 지시] 제공된 이미지(사진)를 면밀히 시각적으로 분석하세요.**
+    당신은 통찰력 있는 예술 큐레이터입니다.
+    제공된 **이미지(사진)**를 면밀히 분석하되, **주어진 스타일 정보('{style_text}')를 분석의 기준으로 삼으세요.**
 
     [작품 정보] 제목:{title}, 작가:{artist}, 장르:{genre}, 스타일:{style_text}
     [지침] {prompt_context}
-    [출력 포맷(JSON)] - 모든 설명은 완성된 문장으로 서술하세요.
+
+    [출력 포맷 (JSON)]
+    * 답변은 한국어 경어체(~합니다)로 작성하세요.
     {{
-        "artist_intro": "작가 설명 (2문장 내외)",
-        "title_meaning": "제목과 이미지 연관성 (2문장 내외)",
-        "art_review": "이미지의 시각적 특징을 바탕으로 한 종합 감상평 (3문장 내외)"
+        "artist_intro": "작가와 해당 스타일의 관계를 설명하는 소개 (2문장)",
+        "title_meaning": "제목이 스타일 및 이미지와 어떻게 연결되는지 해석 (2문장)",
+        "art_review": "화풍('{style_text}')의 특징이 이미지에서 어떻게 드러나는지 구체적으로 서술한 비평 (3~4문장)"
     }}
     """
     try:
@@ -119,37 +128,60 @@ def run_gemini_vision(image_url, title, artist, genre, style):
     except Exception as e:
         print(f"Gemini Vision 에러: {e}"); return None
 
-# 2. 음악 프롬프트 생성
-def run_gemini_music(description, title, artist):
+# 2. 음악 프롬프트 생성 (이미지 + 태그 + 설명 반영)
+def run_gemini_music(image_url, description, title, artist, tags):
+    # 이미지 로드 (음악 생성 시에도 이미지를 봄)
+    img = load_image_from_url(image_url)
+    if not img: return None
+    
     model = genai.GenerativeModel('models/gemini-2.0-flash')
+    
     prompt = f"""
-    음악 프롬프트 엔지니어로서, 다음 정보를 바탕으로 JSON을 출력하세요.
-    [정보] 제목:{title}, 작가:{artist}, 내용:{description}
-    [출력] {{"mood": "...", "instruments": "...", "tempo": "...", "music_prompt": "영어 프롬프트", "explanation": "이유"}}
+    당신은 영화 음악 감독(Film Scorer)입니다. 
+    **제공된 이미지(Picture)**를 보고, 그 시각적 분위기를 소리로 번역(Sonification)하세요.
+    동시에 제공된 설명과 **태그(Tags)** 정보도 참고하여 음악 생성 AI용 프롬프트를 작성하세요.
+    
+    [입력 정보]
+    - 시각 자료: (첨부된 이미지)
+    - 작품 제목/작가: {title} / {artist}
+    - 작품 설명: {description}
+    - **사용자 태그(Tags): {tags}** (이 태그들의 분위기를 음악에 반드시 반영하세요)
+    
+    [지침]
+    1. **시각-청각 변환**: 이미지의 색감이 차가우면 Cool pad나 Reverb를, 붓터치가 거칠면 Distortion이나 Staccato Strings를 사용하는 식입니다.
+    2. **태그 반영**: 사용자가 입력한 태그({tags})가 있다면 그 키워드를 music_prompt에 적극적으로 포함하세요.
+    3. **music_prompt**: Suno/MusicGen이 이해하기 쉬운 **영어 키워드(Tag)** 위주로 작성하세요.
+
+    [출력 포맷 (JSON)]
+    {{
+        "mood": "분위기 (한글)",
+        "instruments": "주요 악기 (한글)",
+        "tempo": "템포 (예: Adagio, 80 BPM)",
+        "music_prompt": "음악 생성용 영어 프롬프트 (High quality, Cinematic, ...)",
+        "explanation": "이미지와 태그를 보고 이 음악을 추천한 이유 (한글 1문장)"
+    }}
     """
+    
     try:
-        response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
+        # 이미지와 텍스트를 함께 전달 (Multimodal)
+        response = model.generate_content([prompt, img], generation_config={"response_mime_type": "application/json"})
         res = json.loads(response.text.replace("```json", "").replace("```", "").strip())
         return res if not isinstance(res, list) else res[0]
-    except Exception: return None
+    except Exception as e:
+        print(f"Gemini Music 에러: {e}"); return None
 
 # --- 🛡️ [통합 로직] AI 처리 및 데이터 보호 함수 ---
 def process_ai_logic(post_id: int, image_url: str, title: str, artist: str, genre: str, style1: str, description: str, tags: str, force_update: bool = False):
-    """
-    모든 AI 생성 로직을 담당하는 중앙 함수입니다.
-    force_update=False이면 기존 데이터가 있을 경우 절대 덮어쓰지 않습니다.
-    """
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
     
     try:
-        # 현재 상태 조회
         cursor.execute("SELECT ai_summary, music_prompt FROM posts WHERE id = %s", (post_id,))
         current_data = cursor.fetchone()
         
         if not current_data: return
 
-        # 1. 그림 분석 (ai_summary)
+        # 1. 그림 분석 (Style 집중 프롬프트 사용)
         if not current_data['ai_summary'] or force_update:
             print(f"🖌️ [Processing] ID {post_id} 그림 분석 시작...")
             vision_res = run_gemini_vision(image_url, title, artist, genre, style1)
@@ -157,7 +189,6 @@ def process_ai_logic(post_id: int, image_url: str, title: str, artist: str, genr
             if vision_res:
                 summary = vision_res.get('art_review', '')
                 
-                # [DB 보호]
                 if force_update:
                     sql = "UPDATE posts SET ai_summary = %s WHERE id = %s"
                 else:
@@ -169,27 +200,26 @@ def process_ai_logic(post_id: int, image_url: str, title: str, artist: str, genr
         else:
             print(f"🛡️ [Protected] ID {post_id} 그림 분석 데이터 보존됨.")
 
-        # 2. 음악 프롬프트 생성 (music_prompt)
-        # [확인] 여기에 음악 프롬프트 생성 로직이 포함되어 있습니다.
+        # 2. 음악 프롬프트 생성 (이미지 + 태그 + 설명 사용)
         if not current_data['music_prompt'] or force_update:
-            # 재료 준비
-            source_text = description or current_data['ai_summary'] or tags or "Art"
+            desc_text = description or current_data['ai_summary'] or "예술 작품"
+            tag_text = tags or ""
             
-            if source_text:
-                print(f"🎵 [Processing] ID {post_id} 음악 프롬프트 생성 시작...")
-                music_res = run_gemini_music(f"{source_text} / 태그: {tags}", title, artist)
+            print(f"🎵 [Processing] ID {post_id} 음악 프롬프트 생성 시작 (이미지+태그)...")
+            
+            # [수정됨] music 함수에 image_url과 tags 전달
+            music_res = run_gemini_music(image_url, desc_text, title, artist, tag_text)
+            
+            if music_res:
+                prompt = music_res.get('music_prompt')
                 
-                if music_res:
-                    prompt = music_res.get('music_prompt')
-                    
-                    # [DB 보호]
-                    if force_update:
-                        sql = "UPDATE posts SET music_prompt = %s WHERE id = %s"
-                    else:
-                        sql = "UPDATE posts SET music_prompt = %s WHERE id = %s AND (music_prompt IS NULL OR music_prompt = '')"
-                    
-                    cursor.execute(sql, (prompt, post_id))
-                    conn.commit()
+                if force_update:
+                    sql = "UPDATE posts SET music_prompt = %s WHERE id = %s"
+                else:
+                    sql = "UPDATE posts SET music_prompt = %s WHERE id = %s AND (music_prompt IS NULL OR music_prompt = '')"
+                
+                cursor.execute(sql, (prompt, post_id))
+                conn.commit()
         else:
              print(f"🛡️ [Protected] ID {post_id} 음악 프롬프트 데이터 보존됨.")
 
@@ -214,11 +244,9 @@ async def create_post(
     style4: Optional[str] = Form(None), style5: Optional[str] = Form(None),
     image: UploadFile = File(...)
 ):
-    # 1. S3 업로드
     image_url = upload_file_to_s3(image)
     if not image_url: raise HTTPException(500, "S3 실패")
 
-    # 2. DB 선 저장 (빠른 응답)
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -231,14 +259,13 @@ async def create_post(
         conn.commit()
         new_post_id = cursor.lastrowid
         
-        # 3. ✨ 백그라운드 AI 작업 등록
         background_tasks.add_task(
             process_ai_logic, 
             new_post_id, image_url, title, artist_name, genre, style1, description, tags,
             True 
         )
         
-        return {"message": "업로드 완료. AI 분석이 백그라운드에서 진행됩니다.", "id": new_post_id}
+        return {"message": "업로드 완료. AI 분석 및 음악 생성 진행 중", "id": new_post_id}
         
     finally: cursor.close(); conn.close()
 
@@ -252,7 +279,6 @@ def get_posts():
     finally:
         cursor.close(); conn.close()
 
-# 수동 분석 요청
 @app.post("/posts/{post_id}/analyze")
 def analyze_art(post_id: int, force_update: bool = False):
     conn = get_db_connection()
@@ -262,7 +288,6 @@ def analyze_art(post_id: int, force_update: bool = False):
         post = cursor.fetchone()
         if not post: raise HTTPException(404, "게시글 없음")
 
-        # 기존 함수 재사용
         process_ai_logic(
             post['id'], post['image_url'], post['title'], post['artist_name'], 
             post['genre'], post['style1'], post['description'], post['tags'],
@@ -271,7 +296,7 @@ def analyze_art(post_id: int, force_update: bool = False):
         
         cursor.execute("SELECT ai_summary FROM posts WHERE id = %s", (post_id,))
         updated_post = cursor.fetchone()
-        return {"message": "요청 완료", "ai_summary": updated_post['ai_summary']}
+        return {"message": "완료", "ai_summary": updated_post['ai_summary']}
     finally: cursor.close(); conn.close()
 
 @app.post("/posts/{post_id}/music")
@@ -291,7 +316,7 @@ def generate_music_prompt(post_id: int, force_update: bool = False):
 
         cursor.execute("SELECT music_prompt FROM posts WHERE id = %s", (post_id,))
         updated_post = cursor.fetchone()
-        return {"message": "요청 완료", "music_prompt": updated_post['music_prompt']}
+        return {"message": "완료", "music_prompt": updated_post['music_prompt']}
     finally: cursor.close(); conn.close()
 
 @app.post("/posts/{post_id}/register_music_url")
@@ -305,7 +330,6 @@ def register_music_url(post_id: int, body: MusicUrlUpdate):
     finally:
         cursor.close(); conn.close()
 
-# 수동 동기화 요청
 @app.post("/posts/sync-ai")
 def sync_missing_ai_data():
     conn = get_db_connection()
@@ -313,8 +337,7 @@ def sync_missing_ai_data():
     try:
         cursor.execute("SELECT * FROM posts WHERE ai_summary IS NULL OR music_prompt IS NULL")
         empty_posts = cursor.fetchall()
-
-        if not empty_posts: return {"message": "모든 데이터가 최신입니다."}
+        if not empty_posts: return {"message": "최신 상태입니다."}
 
         for post in empty_posts:
             process_ai_logic(
@@ -322,38 +345,33 @@ def sync_missing_ai_data():
                 post['genre'], post['style1'], post['description'], post['tags'],
                 False 
             )
-
-        return {"message": f"총 {len(empty_posts)}건 보정 요청 완료"}
+        return {"message": f"{len(empty_posts)}건 요청 완료"}
     finally:
         cursor.close(); conn.close()
 
-# --- ⏰ [Scheduler] 1분 주기 자동 보정 스케줄러 ---
+# --- ⏰ 스케줄러 ---
 async def periodic_sync_task():
-    """1분마다 무한 반복하며 비어있는 AI 데이터를 채웁니다."""
-    print("⏰ [Scheduler] 1분 주기 자동 보정 스케줄러가 시작되었습니다.")
-    
+    print("⏰ [Scheduler] 1분 주기 자동 보정 시작")
     while True:
         try:
             await asyncio.sleep(60)
-            
             conn = get_db_connection()
             cursor = conn.cursor(dictionary=True)
             cursor.execute("SELECT * FROM posts WHERE ai_summary IS NULL OR music_prompt IS NULL")
             empty_posts = cursor.fetchall()
             
             if empty_posts:
-                print(f"🔍 [Scheduler] {len(empty_posts)}개의 누락 데이터 발견. 보정 시작...")
+                print(f"🔍 [Scheduler] {len(empty_posts)}건 발견. 보정 시작...")
                 for post in empty_posts:
                     process_ai_logic(
                         post['id'], post['image_url'], post['title'], post['artist_name'], 
                         post['genre'], post['style1'], post['description'], post['tags'],
-                        False # 안전 모드
+                        False 
                     )
             cursor.close(); conn.close()
         except Exception as e:
-            print(f"⚠️ [Scheduler] 에러 발생 (1분 후 재시도): {e}")
+            print(f"⚠️ [Scheduler] 에러: {e}")
 
-# 서버 시작 시 스케줄러 실행
 @app.on_event("startup")
 async def on_startup():
     asyncio.create_task(periodic_sync_task())
