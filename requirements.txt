@@ -4,9 +4,7 @@ mysql-connector-python
 python-dotenv
 boto3
 python-multipart
-streamlit
 google-generativeai
-openai
 requests
 Pillow
 pydantic
