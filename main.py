@@ -45,6 +45,10 @@ s3_client = boto3.client(
 BUCKET_NAME = os.getenv("AWS_BUCKET_NAME")
 REGION = os.getenv("AWS_REGION")
 
+# --- Pydantic Models (위치: 사용 전 정의 필수) ---
+class MusicUrlUpdate(BaseModel):
+    music_url: str
+
 # --- Helper Functions ---
 
 def upload_file_to_s3(file: UploadFile):
@@ -76,6 +80,7 @@ def get_db_connection():
 
 # --- AI Core Functions ---
 
+# 1. 그림 분석 (이미지 우선)
 def run_gemini_vision(image_url, title, artist, genre, style):
     img = load_image_from_url(image_url)
     if not img: return None
@@ -83,7 +88,6 @@ def run_gemini_vision(image_url, title, artist, genre, style):
     
     style_text = style if style else "특별히 지정되지 않음"
     
-    # [핵심] 이미지 분석 최우선 프롬프트 구성
     if genre in ["그림", "조각", "Painting", "Sculpture", "유화", "수채화", "동양화", "드로잉"]:
         prompt_context = f"""
         이 작품의 장르는 '{genre}'이며, 텍스트상 화풍은 '{style_text}'입니다.
@@ -115,6 +119,7 @@ def run_gemini_vision(image_url, title, artist, genre, style):
     except Exception as e:
         print(f"Gemini Vision 에러: {e}"); return None
 
+# 2. 음악 프롬프트 생성
 def run_gemini_music(description, title, artist):
     model = genai.GenerativeModel('models/gemini-2.0-flash')
     prompt = f"""
@@ -128,7 +133,7 @@ def run_gemini_music(description, title, artist):
         return res if not isinstance(res, list) else res[0]
     except Exception: return None
 
-# --- 🛡️ [통합 로직] AI 처리 및 데이터 보호 함수 (중복 제거의 핵심) ---
+# --- 🛡️ [통합 로직] AI 처리 및 데이터 보호 함수 ---
 def process_ai_logic(post_id: int, image_url: str, title: str, artist: str, genre: str, style1: str, description: str, tags: str, force_update: bool = False):
     """
     모든 AI 생성 로직을 담당하는 중앙 함수입니다.
@@ -145,7 +150,6 @@ def process_ai_logic(post_id: int, image_url: str, title: str, artist: str, genr
         if not current_data: return
 
         # 1. 그림 분석 (ai_summary)
-        # 조건: 데이터가 비어있거나 OR 강제 업데이트일 때만 실행
         if not current_data['ai_summary'] or force_update:
             print(f"🖌️ [Processing] ID {post_id} 그림 분석 시작...")
             vision_res = run_gemini_vision(image_url, title, artist, genre, style1)
@@ -153,22 +157,20 @@ def process_ai_logic(post_id: int, image_url: str, title: str, artist: str, genr
             if vision_res:
                 summary = vision_res.get('art_review', '')
                 
-                # [DB 레벨 보호] SQL 조건문 분기
+                # [DB 보호]
                 if force_update:
                     sql = "UPDATE posts SET ai_summary = %s WHERE id = %s"
                 else:
-                    # 💡 값이 비어있을 때만 업데이트 (동시성 문제 해결)
                     sql = "UPDATE posts SET ai_summary = %s WHERE id = %s AND (ai_summary IS NULL OR ai_summary = '')"
                 
                 cursor.execute(sql, (summary, post_id))
                 conn.commit()
-                # 음악 생성을 위해 변수 갱신
                 current_data['ai_summary'] = summary
         else:
             print(f"🛡️ [Protected] ID {post_id} 그림 분석 데이터 보존됨.")
 
         # 2. 음악 프롬프트 생성 (music_prompt)
-        # 조건: 데이터가 비어있거나 OR 강제 업데이트일 때만 실행
+        # [확인] 여기에 음악 프롬프트 생성 로직이 포함되어 있습니다.
         if not current_data['music_prompt'] or force_update:
             # 재료 준비
             source_text = description or current_data['ai_summary'] or tags or "Art"
@@ -180,7 +182,7 @@ def process_ai_logic(post_id: int, image_url: str, title: str, artist: str, genr
                 if music_res:
                     prompt = music_res.get('music_prompt')
                     
-                    # [DB 레벨 보호]
+                    # [DB 보호]
                     if force_update:
                         sql = "UPDATE posts SET music_prompt = %s WHERE id = %s"
                     else:
@@ -216,7 +218,7 @@ async def create_post(
     image_url = upload_file_to_s3(image)
     if not image_url: raise HTTPException(500, "S3 실패")
 
-    # 2. DB 선 저장 (빈 값으로 저장하여 응답 속도 최적화)
+    # 2. DB 선 저장 (빠른 응답)
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -229,11 +231,11 @@ async def create_post(
         conn.commit()
         new_post_id = cursor.lastrowid
         
-        # 3. ✨ 백그라운드 작업 등록 (통합 함수 호출)
+        # 3. ✨ 백그라운드 AI 작업 등록
         background_tasks.add_task(
             process_ai_logic, 
             new_post_id, image_url, title, artist_name, genre, style1, description, tags,
-            True # 업로드 직후는 비어있으므로 생성 시도
+            True 
         )
         
         return {"message": "업로드 완료. AI 분석이 백그라운드에서 진행됩니다.", "id": new_post_id}
@@ -260,17 +262,15 @@ def analyze_art(post_id: int, force_update: bool = False):
         post = cursor.fetchone()
         if not post: raise HTTPException(404, "게시글 없음")
 
-        # 통합 처리 로직 호출
+        # 기존 함수 재사용
         process_ai_logic(
             post['id'], post['image_url'], post['title'], post['artist_name'], 
             post['genre'], post['style1'], post['description'], post['tags'],
             force_update
         )
         
-        # 결과 반환용 재조회
         cursor.execute("SELECT ai_summary FROM posts WHERE id = %s", (post_id,))
         updated_post = cursor.fetchone()
-        
         return {"message": "요청 완료", "ai_summary": updated_post['ai_summary']}
     finally: cursor.close(); conn.close()
 
@@ -317,7 +317,6 @@ def sync_missing_ai_data():
         if not empty_posts: return {"message": "모든 데이터가 최신입니다."}
 
         for post in empty_posts:
-            # 안전하게 채우기 (force_update=False)
             process_ai_logic(
                 post['id'], post['image_url'], post['title'], post['artist_name'], 
                 post['genre'], post['style1'], post['description'], post['tags'],
@@ -335,13 +334,10 @@ async def periodic_sync_task():
     
     while True:
         try:
-            # 60초 대기
             await asyncio.sleep(60)
             
             conn = get_db_connection()
             cursor = conn.cursor(dictionary=True)
-            
-            # 비어있는 데이터 조회
             cursor.execute("SELECT * FROM posts WHERE ai_summary IS NULL OR music_prompt IS NULL")
             empty_posts = cursor.fetchall()
             
@@ -353,9 +349,7 @@ async def periodic_sync_task():
                         post['genre'], post['style1'], post['description'], post['tags'],
                         False # 안전 모드
                     )
-            
             cursor.close(); conn.close()
-            
         except Exception as e:
             print(f"⚠️ [Scheduler] 에러 발생 (1분 후 재시도): {e}")
 
