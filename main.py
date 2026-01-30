@@ -505,3 +505,14 @@ def update_purchase_status(req_id: int, body: PurchaseStatusUpdate):
         conn.commit()
         return {"message": f"요청 상태가 {body.status}(으)로 변경되었습니다."}
     finally: cursor.close(); conn.close()
+        
+# 특정 전시회에 등록된 모든 작품 목록 가져오기
+@app.get("/admin/exhibitions/{ex_id}/artworks")
+def get_exhibition_artworks(ex_id: int):
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        sql = "SELECT * FROM artworks WHERE exhibition_id = %s ORDER BY created_at DESC"
+        cursor.execute(sql, (ex_id,))
+        return cursor.fetchall()
+    finally: cursor.close(); conn.close()
