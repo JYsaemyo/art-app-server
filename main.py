@@ -447,34 +447,32 @@ async def register_artwork(
     ex_id: int = Form(...), 
     title: str = Form(...), 
     artist: str = Form(...), 
-    description: str = Form(""), # 작가가 직접 입력한 설명
+    description: str = Form(""), 
     price: int = Form(0), 
     image: UploadFile = File(...)
 ):
-    # 1. 이미지 S3 업로드 (재사용)
+    print(f"📥 요청 도착: {title}, {artist}") # 로그 확인용
+    
+    # 1. S3 업로드 시도
     image_url = upload_file_to_s3(image)
     if not image_url:
-        raise HTTPException(500, "이미지 업로드 실패")
+        print("❌ S3 업로드 실패")
+        raise HTTPException(500, "S3 업로드 실패")
+    
+    print(f"✅ S3 업로드 성공: {image_url}")
 
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        # NFC UUID 자동 생성
         nfc_uuid = f"nfc_{uuid.uuid4().hex[:8]}"
-        
-        # 2. 작가의 설명을 포함하여 DB 저장
-        sql = """
-            INSERT INTO artworks (exhibition_id, title, artist_name, description, price, image_url, nfc_uuid) 
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """
+        sql = "INSERT INTO artworks (exhibition_id, title, artist_name, description, price, image_url, nfc_uuid) VALUES (%s, %s, %s, %s, %s, %s, %s)"
         cursor.execute(sql, (ex_id, title, artist, description, price, image_url, nfc_uuid))
         conn.commit()
-        
-        return {
-            "message": "작품 정보가 성공적으로 저장되었습니다.",
-            "artwork_id": cursor.lastrowid,
-            "image_url": image_url
-        }
+        print("✅ DB 저장 성공!")
+        return {"message": "저장 성공", "artwork_id": cursor.lastrowid}
+    except Exception as e:
+        print(f"❌ DB 에러 발생: {e}") # 여기서 에러 내용이 Render 로그에 찍힙니다.
+        raise HTTPException(500, f"DB 에러: {str(e)}")
     finally:
         cursor.close(); conn.close()
 
