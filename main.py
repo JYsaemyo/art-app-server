@@ -368,3 +368,140 @@ async def periodic_sync_task():
 @app.on_event("startup")
 async def on_startup():
     asyncio.create_task(periodic_sync_task())
+
+# --- [추가] Admin 전용 Pydantic Models ---
+class ExhibitionCreate(BaseModel):
+    title: str
+    date: str
+    location: str
+    description: Optional[str] = None
+
+class ArtworkCreate(BaseModel):
+    exhibition_id: int
+    title: str
+    artist_name: str
+    price: int
+    image_url: str
+    nfc_uuid: str
+
+class PurchaseStatusUpdate(BaseModel):
+    status: str  # 'APPROVED' or 'REJECTED'
+
+# --- 🚀 [Admin] 1. 전시회 관리 함수 섹션 ---
+
+# 모든 전시회 목록 조회 (사용자 태깅 수 계산 포함)
+@app.get("/admin/exhibitions/")
+def get_admin_exhibitions():
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        # 전시회 제목과 posts 테이블의 제목을 매칭하여 '전체 태그' 수를 실시간 집계합니다.
+        sql = """
+            SELECT e.*, COUNT(p.id) as total_tags 
+            FROM exhibitions e 
+            LEFT JOIN posts p ON p.title = e.title 
+            GROUP BY e.id ORDER BY e.id DESC
+        """
+        cursor.execute(sql)
+        return cursor.fetchall()
+    finally: cursor.close(); conn.close()
+
+# 새 전시회 생성 (중앙 + 버튼 연동)
+@app.post("/admin/exhibitions/")
+def create_exhibition(ex: ExhibitionCreate):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        sql = "INSERT INTO exhibitions (title, date, location, description) VALUES (%s, %s, %s, %s)"
+        cursor.execute(sql, (ex.title, ex.date, ex.location, ex.description))
+        conn.commit()
+        return {"id": cursor.lastrowid, "message": "전시회 정보가 등록되었습니다."}
+    finally: cursor.close(); conn.close()
+
+# 특정 전시회 상세 통계 (Google Analytics 스타일)
+@app.get("/admin/exhibitions/{ex_id}/stats")
+def get_exhibition_analytics(ex_id: int):
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute("SELECT title FROM exhibitions WHERE id = %s", (ex_id,))
+        ex = cursor.fetchone()
+        if not ex: raise HTTPException(404, "전시회를 찾을 수 없습니다.")
+        
+        # 최근 7일간의 날짜별 태깅(방문) 추이를 가져옵니다.
+        sql = """
+            SELECT DATE(created_at) as date, COUNT(*) as count 
+            FROM posts WHERE title = %s 
+            GROUP BY DATE(created_at) ORDER BY date ASC LIMIT 7
+        """
+        cursor.execute(sql, (ex['title'],))
+        return {"title": ex['title'], "daily_stats": cursor.fetchall()}
+    finally: cursor.close(); conn.close()
+
+
+# --- 🚀 [Admin] 2. 공식 작품 등록 섹션 (NFC 매칭용) ---
+
+# 전시회 담당자가 공식 작품을 등록할 때 사용하는 POST
+@app.post("/admin/artworks/")
+async def register_official_artwork(
+    ex_id: int = Form(...), title: str = Form(...), artist: str = Form(...), 
+    price: int = Form(...), nfc_id: str = Form(...), image: UploadFile = File(...)
+):
+    # 공식 작품 이미지 S3 업로드
+    image_url = upload_file_to_s3(image)
+    if not image_url: raise HTTPException(500, "이미지 업로드 실패")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        sql = """
+            INSERT INTO artworks (exhibition_id, title, artist_name, price, image_url, nfc_uuid) 
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """
+        cursor.execute(sql, (ex_id, title, artist, price, image_url, nfc_id))
+        conn.commit()
+        return {"message": "공식 작품 등록 및 NFC 매칭 완료", "id": cursor.lastrowid}
+    finally: cursor.close(); conn.close()
+
+
+# --- 🚀 [Admin] 3. 판매 및 구매 요청 섹션 ---
+
+# 전시회별로 그룹화된 구매 요청 목록 조회
+@app.get("/admin/sales/requests")
+def get_purchase_requests():
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        # 어느 전시회의 어떤 작품인지 JOIN을 통해 상세히 가져옵니다.
+        sql = """
+            SELECT e.title as exhibition_name, pr.id as request_id, a.title as art_title, 
+                   pr.buyer_name, pr.price as requested_price, pr.status
+            FROM purchase_requests pr
+            JOIN artworks a ON pr.artwork_id = a.id
+            JOIN exhibitions e ON a.exhibition_id = e.id
+            ORDER BY e.title, pr.created_at DESC
+        """
+        cursor.execute(sql)
+        rows = cursor.fetchall()
+        
+        # 프론트엔드 UI(SectionList) 구성을 위해 전시회별로 그룹화
+        grouped_data = {}
+        for row in rows:
+            name = row['exhibition_name']
+            if name not in grouped_data: grouped_data[name] = []
+            grouped_data[name].append(row)
+        
+        return [{"exhibition": k, "data": v} for k, v in grouped_data.items()]
+    finally: cursor.close(); conn.close()
+
+# 구매 요청 승인/거절 처리
+@app.post("/admin/sales/requests/{req_id}/status")
+def update_purchase_status(req_id: int, body: PurchaseStatusUpdate):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        sql = "UPDATE purchase_requests SET status = %s WHERE id = %s"
+        cursor.execute(sql, (body.status, req_id))
+        conn.commit()
+        return {"message": f"요청 상태가 {body.status}(으)로 변경되었습니다."}
+    finally: cursor.close(); conn.close()
