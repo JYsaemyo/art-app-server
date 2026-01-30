@@ -441,27 +441,42 @@ def get_exhibition_analytics(ex_id: int):
 
 # --- 🚀 [Admin] 2. 공식 작품 등록 섹션 (NFC 매칭용) ---
 
-# 전시회 담당자가 공식 작품을 등록할 때 사용하는 POST
+# --- [Admin] 공식 작품 등록 (순수 작가 설명 저장) ---
 @app.post("/admin/artworks/")
-async def register_official_artwork(
-    ex_id: int = Form(...), title: str = Form(...), artist: str = Form(...), 
-    price: int = Form(...), nfc_id: str = Form(...), image: UploadFile = File(...)
+async def register_artwork(
+    ex_id: int = Form(...), 
+    title: str = Form(...), 
+    artist: str = Form(...), 
+    description: str = Form(""), # 작가가 직접 입력한 설명
+    price: int = Form(0), 
+    image: UploadFile = File(...)
 ):
-    # 공식 작품 이미지 S3 업로드
+    # 1. 이미지 S3 업로드 (재사용)
     image_url = upload_file_to_s3(image)
-    if not image_url: raise HTTPException(500, "이미지 업로드 실패")
+    if not image_url:
+        raise HTTPException(500, "이미지 업로드 실패")
 
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
+        # NFC UUID 자동 생성
+        nfc_uuid = f"nfc_{uuid.uuid4().hex[:8]}"
+        
+        # 2. 작가의 설명을 포함하여 DB 저장
         sql = """
-            INSERT INTO artworks (exhibition_id, title, artist_name, price, image_url, nfc_uuid) 
-            VALUES (%s, %s, %s, %s, %s, %s)
+            INSERT INTO artworks (exhibition_id, title, artist_name, description, price, image_url, nfc_uuid) 
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
         """
-        cursor.execute(sql, (ex_id, title, artist, price, image_url, nfc_id))
+        cursor.execute(sql, (ex_id, title, artist, description, price, image_url, nfc_uuid))
         conn.commit()
-        return {"message": "공식 작품 등록 및 NFC 매칭 완료", "id": cursor.lastrowid}
-    finally: cursor.close(); conn.close()
+        
+        return {
+            "message": "작품 정보가 성공적으로 저장되었습니다.",
+            "artwork_id": cursor.lastrowid,
+            "image_url": image_url
+        }
+    finally:
+        cursor.close(); conn.close()
 
 
 # --- 🚀 [Admin] 3. 판매 및 구매 요청 섹션 ---
