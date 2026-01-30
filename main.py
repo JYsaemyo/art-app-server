@@ -531,3 +531,54 @@ def get_exhibition_artworks(ex_id: int):
         cursor.execute(sql, (ex_id,))
         return cursor.fetchall()
     finally: cursor.close(); conn.close()
+        
+# 5. 작품 수정 (이미지 변경 없으면 기존 유지)
+@app.put("/admin/artworks/{art_id}")
+async def update_artwork(
+    art_id: int,
+    title: str = Form(...),
+    artist: str = Form(...),
+    genre: str = Form(...),
+    description: str = Form(""),
+    # 이미지는 없을 수도 있음 (None 허용)
+    image: UploadFile = File(None) 
+):
+    print(f"🔄 작품 수정 요청 ID: {art_id}, 제목: {title}")
+
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    try:
+        # 1. 기존 이미지 URL 가져오기
+        cursor.execute("SELECT image_url FROM artworks WHERE id = %s", (art_id,))
+        existing_art = cursor.fetchone()
+        
+        if not existing_art:
+            raise HTTPException(404, "작품을 찾을 수 없습니다.")
+
+        final_image_url = existing_art['image_url']
+
+        # 2. 새 이미지가 왔다면 S3 업로드 후 URL 교체
+        if image:
+            print("📸 새 이미지 업로드 중...")
+            new_url = upload_file_to_s3(image)
+            if new_url:
+                final_image_url = new_url
+
+        # 3. DB 업데이트 (artist -> artist_name 매핑 주의)
+        sql = """
+            UPDATE artworks 
+            SET title = %s, artist_name = %s, genre = %s, description = %s, image_url = %s
+            WHERE id = %s
+        """
+        cursor.execute(sql, (title, artist, genre, description, final_image_url, art_id))
+        conn.commit()
+        
+        print("✅ 수정 완료")
+        return {"message": "수정되었습니다.", "image_url": final_image_url}
+
+    except Exception as e:
+        print(f"❌ 수정 에러: {e}")
+        raise HTTPException(500, f"에러: {str(e)}")
+    finally:
+        cursor.close(); conn.close()
