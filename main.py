@@ -441,37 +441,39 @@ def get_exhibition_analytics(ex_id: int):
 
 # --- 🚀 [Admin] 2. 공식 작품 등록 섹션 (NFC 매칭용) ---
 
-# --- [Admin] 공식 작품 등록 (순수 작가 설명 저장) ---
+# 3. 작품 등록 (AI 제거, 장르/설명 직접 입력)
 @app.post("/admin/artworks/")
 async def register_artwork(
     ex_id: int = Form(...), 
     title: str = Form(...), 
     artist: str = Form(...), 
+    genre: str = Form("회화"), # 기본값 설정
     description: str = Form(""), 
     price: int = Form(0), 
     image: UploadFile = File(...)
 ):
-    print(f"📥 요청 도착: {title}, {artist}") # 로그 확인용
-    
-    # 1. S3 업로드 시도
+    print(f"📥 작품 등록 요청: {title} ({genre})")
+
+    # S3 업로드
     image_url = upload_file_to_s3(image)
     if not image_url:
-        print("❌ S3 업로드 실패")
         raise HTTPException(500, "S3 업로드 실패")
     
-    print(f"✅ S3 업로드 성공: {image_url}")
-
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
+        # DB 저장 (AI 관련 필드 제거됨)
         nfc_uuid = f"nfc_{uuid.uuid4().hex[:8]}"
-        sql = "INSERT INTO artworks (exhibition_id, title, artist_name, description, price, image_url, nfc_uuid) VALUES (%s, %s, %s, %s, %s, %s, %s)"
-        cursor.execute(sql, (ex_id, title, artist, description, price, image_url, nfc_uuid))
+        sql = """
+            INSERT INTO artworks (exhibition_id, title, artist_name, genre, description, price, image_url, nfc_uuid) 
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        cursor.execute(sql, (ex_id, title, artist, genre, description, price, image_url, nfc_uuid))
         conn.commit()
         print("✅ DB 저장 성공!")
         return {"message": "저장 성공", "artwork_id": cursor.lastrowid}
     except Exception as e:
-        print(f"❌ DB 에러 발생: {e}") # 여기서 에러 내용이 Render 로그에 찍힙니다.
+        print(f"❌ DB 에러: {e}")
         raise HTTPException(500, f"DB 에러: {str(e)}")
     finally:
         cursor.close(); conn.close()
