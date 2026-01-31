@@ -1,8 +1,9 @@
-from fastapi import FastAPI, HTTPException, Form, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Form, UploadFile, File, BackgroundTasks, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import mysql.connector
 import os
+import uvicorn
 import boto3
 import uuid
 import json
@@ -13,6 +14,11 @@ import google.generativeai as genai
 from dotenv import load_dotenv
 from typing import Optional
 import asyncio
+import base64
+import hashlib
+import hmac
+import secrets
+from datetime import datetime, timedelta
 
 # 1. 환경 변수 로드
 load_dotenv()
@@ -30,7 +36,9 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    # 브라우저(웹)에서는 allow_credentials=True + allow_origins="*" 조합이 차단되어
+    # CORS가 "Network Error"로 보일 수 있습니다. (쿠키 기반 인증도 현재 사용하지 않음)
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -48,6 +56,16 @@ REGION = os.getenv("AWS_REGION")
 # --- Pydantic Models ---
 class MusicUrlUpdate(BaseModel):
     music_url: str
+
+# --- [추가] Admin Auth Pydantic Models ---
+class AdminRegisterIn(BaseModel):
+    email: str
+    name: str
+    password: str
+
+class AdminLoginIn(BaseModel):
+    email: str
+    password: str
 
 # --- Helper Functions ---
 
@@ -77,6 +95,136 @@ def get_db_connection():
         user=os.getenv("DB_USER"), password=os.getenv("DB_PASSWORD"),
         database=os.getenv("DB_NAME")
     )
+
+# --- [추가] Admin Auth Helpers ---
+
+_ADMIN_PBKDF2_ITERATIONS = int(os.getenv("ADMIN_PBKDF2_ITERATIONS", "200000"))
+_ADMIN_SESSION_TTL_HOURS = int(os.getenv("ADMIN_SESSION_TTL_HOURS", str(24 * 7)))
+
+def _normalize_email(email: str) -> str:
+    return (email or "").strip().lower()
+
+def hash_password(password: str) -> str:
+    if not password or len(password) < 4:
+        raise HTTPException(400, "비밀번호가 너무 짧습니다.")
+
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        _ADMIN_PBKDF2_ITERATIONS,
+    )
+    salt_b64 = base64.urlsafe_b64encode(salt).decode("utf-8")
+    dk_b64 = base64.urlsafe_b64encode(dk).decode("utf-8")
+    return f"pbkdf2_sha256${_ADMIN_PBKDF2_ITERATIONS}${salt_b64}${dk_b64}"
+
+def verify_password(password: str, password_hash: str) -> bool:
+    try:
+        scheme, iters_str, salt_b64, dk_b64 = (password_hash or "").split("$", 3)
+        if scheme != "pbkdf2_sha256":
+            return False
+        iterations = int(iters_str)
+        salt = base64.urlsafe_b64decode(salt_b64.encode("utf-8"))
+        expected = base64.urlsafe_b64decode(dk_b64.encode("utf-8"))
+        actual = hashlib.pbkdf2_hmac(
+            "sha256",
+            (password or "").encode("utf-8"),
+            salt,
+            iterations,
+        )
+        return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
+
+def ensure_admin_auth_tables():
+    """
+    기존 기능에 영향 없이, admin 전용 인증 테이블만 준비합니다.
+    (CREATE TABLE IF NOT EXISTS 만 사용)
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admin_users (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                email VARCHAR(255) NOT NULL UNIQUE,
+                name VARCHAR(255) NOT NULL,
+                password_hash VARCHAR(512) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admin_sessions (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                token VARCHAR(255) NOT NULL UNIQUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at DATETIME NOT NULL,
+                revoked TINYINT(1) NOT NULL DEFAULT 0,
+                INDEX idx_admin_sessions_user_id (user_id),
+                INDEX idx_admin_sessions_expires_at (expires_at),
+                CONSTRAINT fk_admin_sessions_user_id
+                    FOREIGN KEY (user_id) REFERENCES admin_users(id)
+                    ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        conn.commit()
+        print("✅ [Auth] admin_users/admin_sessions 테이블 준비 완료")
+    finally:
+        cursor.close()
+        conn.close()
+
+def _get_bearer_token(authorization: Optional[str]) -> str:
+    if not authorization:
+        raise HTTPException(401, "Authorization 헤더가 필요합니다.")
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
+        raise HTTPException(401, "Authorization 형식이 올바르지 않습니다. (Bearer <token>)")
+    return parts[1].strip()
+
+def create_admin_session(conn, user_id: int) -> str:
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.utcnow() + timedelta(hours=_ADMIN_SESSION_TTL_HOURS)
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "INSERT INTO admin_sessions (user_id, token, expires_at, revoked) VALUES (%s, %s, %s, %s)",
+            (user_id, token, expires_at, 0),
+        )
+        conn.commit()
+        return token
+    finally:
+        cursor.close()
+
+def require_admin_user(authorization: Optional[str] = Header(None)):
+    token = _get_bearer_token(authorization)
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            """
+            SELECT u.id, u.email, u.name
+            FROM admin_sessions s
+            JOIN admin_users u ON u.id = s.user_id
+            WHERE s.token = %s
+              AND s.revoked = 0
+              AND s.expires_at > UTC_TIMESTAMP()
+            LIMIT 1
+            """,
+            (token,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(401, "세션이 만료되었거나 유효하지 않습니다.")
+        return row
+    finally:
+        cursor.close()
+        conn.close()
 
 # --- AI Core Functions ---
 
@@ -223,6 +371,89 @@ def process_ai_logic(post_id: int, image_url: str, title: str, artist: str, genr
 def read_root():
     return {"message": "Art App Backend is Live!"}
 
+# --- [추가] Admin Auth Endpoints ---
+
+@app.post("/auth/register")
+def auth_register(body: AdminRegisterIn):
+    email = _normalize_email(body.email)
+    name = (body.name or "").strip()
+    password = body.password or ""
+
+    if not email or "@" not in email:
+        raise HTTPException(400, "이메일 형식이 올바르지 않습니다.")
+    if not name:
+        raise HTTPException(400, "이름이 필요합니다.")
+
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor2 = conn.cursor()
+    try:
+        cursor.execute("SELECT id FROM admin_users WHERE email = %s LIMIT 1", (email,))
+        if cursor.fetchone():
+            raise HTTPException(409, "이미 가입된 이메일입니다.")
+
+        pw_hash = hash_password(password)
+        cursor2.execute(
+            "INSERT INTO admin_users (email, name, password_hash) VALUES (%s, %s, %s)",
+            (email, name, pw_hash),
+        )
+        conn.commit()
+        user_id = cursor2.lastrowid
+
+        token = create_admin_session(conn, user_id)
+        return {"token": token, "user": {"id": user_id, "email": email, "name": name}}
+    except mysql.connector.IntegrityError:
+        # 레이스 컨디션 등으로 UNIQUE 충돌 시
+        raise HTTPException(409, "이미 가입된 이메일입니다.")
+    finally:
+        cursor.close()
+        cursor2.close()
+        conn.close()
+
+@app.post("/auth/login")
+def auth_login(body: AdminLoginIn):
+    email = _normalize_email(body.email)
+    password = body.password or ""
+
+    if not email or "@" not in email:
+        raise HTTPException(400, "이메일 형식이 올바르지 않습니다.")
+
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            "SELECT id, email, name, password_hash FROM admin_users WHERE email = %s LIMIT 1",
+            (email,),
+        )
+        user = cursor.fetchone()
+        if not user or not verify_password(password, user.get("password_hash")):
+            raise HTTPException(401, "이메일 또는 비밀번호가 올바르지 않습니다.")
+
+        token = create_admin_session(conn, int(user["id"]))
+        return {"token": token, "user": {"id": int(user["id"]), "email": user["email"], "name": user["name"]}}
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.get("/auth/me")
+def auth_me(user=Depends(require_admin_user)):
+    return {"user": {"id": int(user["id"]), "email": user["email"], "name": user["name"]}}
+
+@app.post("/auth/logout")
+def auth_logout(authorization: Optional[str] = Header(None)):
+    token = _get_bearer_token(authorization)
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("UPDATE admin_sessions SET revoked = 1 WHERE token = %s", (token,))
+        conn.commit()
+        if cursor.rowcount == 0:
+            raise HTTPException(401, "세션이 유효하지 않습니다.")
+        return {"message": "ok"}
+    finally:
+        cursor.close()
+        conn.close()
+
 @app.post("/posts/")
 async def create_post(
     background_tasks: BackgroundTasks, 
@@ -367,7 +598,20 @@ async def periodic_sync_task():
 
 @app.on_event("startup")
 async def on_startup():
+    try:
+        ensure_admin_auth_tables()
+    except Exception as e:
+        # auth 테이블 준비 실패가 기존 기능까지 죽이지 않도록 보호
+        print(f"⚠️ [Auth] 테이블 준비 실패: {e}")
     asyncio.create_task(periodic_sync_task())
+
+
+if __name__ == "__main__":
+    # ✅ `python main.py`로도 바로 실행 가능하게 엔트리포인트를 추가합니다.
+    # - host=0.0.0.0 : 실기기/에뮬레이터에서 PC로 접근 가능
+    # - port : .env의 PORT를 사용하되, 없으면 8000
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
 
 # --- [추가] Admin 전용 Pydantic Models ---
 class ExhibitionCreate(BaseModel):
@@ -386,6 +630,13 @@ class ArtworkCreate(BaseModel):
 
 class PurchaseStatusUpdate(BaseModel):
     status: str  # 'APPROVED' or 'REJECTED'
+
+# --- [추가] Admin 전용 Update Models ---
+class ExhibitionUpdate(BaseModel):
+    title: Optional[str] = None
+    date: Optional[str] = None
+    location: Optional[str] = None
+    description: Optional[str] = None
 
 # --- 🚀 [Admin] 1. 전시회 관리 함수 섹션 ---
 
@@ -418,6 +669,59 @@ def create_exhibition(ex: ExhibitionCreate):
         return {"id": cursor.lastrowid, "message": "전시회 정보가 등록되었습니다."}
     finally: cursor.close(); conn.close()
 
+# 전시회 정보 수정
+@app.put("/admin/exhibitions/{ex_id}")
+def update_exhibition(ex_id: int, body: ExhibitionUpdate):
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute("SELECT * FROM exhibitions WHERE id = %s", (ex_id,))
+        existing = cursor.fetchone()
+        if not existing:
+            raise HTTPException(404, "전시회를 찾을 수 없습니다.")
+
+        new_title = body.title if body.title is not None else existing.get("title")
+        new_date = body.date if body.date is not None else existing.get("date")
+        new_location = body.location if body.location is not None else existing.get("location")
+        new_description = body.description if body.description is not None else existing.get("description")
+
+        # 업데이트할 값이 하나도 없으면 그대로 반환
+        if (
+            body.title is None
+            and body.date is None
+            and body.location is None
+            and body.description is None
+        ):
+            return {"message": "변경 사항이 없습니다.", "id": ex_id}
+
+        cursor2 = conn.cursor()
+        sql = """
+            UPDATE exhibitions
+            SET title = %s, date = %s, location = %s, description = %s
+            WHERE id = %s
+        """
+        cursor2.execute(sql, (new_title, new_date, new_location, new_description, ex_id))
+        conn.commit()
+        cursor2.close()
+
+        return {"message": "전시회 정보가 수정되었습니다.", "id": ex_id}
+    finally:
+        cursor.close(); conn.close()
+
+# 전시회 상세 조회 (필요 시 프론트에서 사용)
+@app.get("/admin/exhibitions/{ex_id}")
+def get_exhibition_detail(ex_id: int):
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute("SELECT * FROM exhibitions WHERE id = %s", (ex_id,))
+        ex = cursor.fetchone()
+        if not ex:
+            raise HTTPException(404, "전시회를 찾을 수 없습니다.")
+        return ex
+    finally:
+        cursor.close(); conn.close()
+
 # 특정 전시회 상세 통계 (Google Analytics 스타일)
 @app.get("/admin/exhibitions/{ex_id}/stats")
 def get_exhibition_analytics(ex_id: int):
@@ -441,40 +745,124 @@ def get_exhibition_analytics(ex_id: int):
 
 # --- 🚀 [Admin] 2. 공식 작품 등록 섹션 (NFC 매칭용) ---
 
-# 3. 작품 등록 (AI 제거, 장르/설명 직접 입력)
+# --- [Admin] 공식 작품 등록 (순수 작가 설명 저장) ---
 @app.post("/admin/artworks/")
 async def register_artwork(
     ex_id: int = Form(...), 
     title: str = Form(...), 
     artist: str = Form(...), 
-    genre: str = Form("회화"), # 기본값 설정
     description: str = Form(""), 
     price: int = Form(0), 
     image: UploadFile = File(...)
 ):
-    print(f"📥 작품 등록 요청: {title} ({genre})")
-
-    # S3 업로드
+    print(f"📥 요청 도착: {title}, {artist}") # 로그 확인용
+    
+    # 1. S3 업로드 시도
     image_url = upload_file_to_s3(image)
     if not image_url:
+        print("❌ S3 업로드 실패")
         raise HTTPException(500, "S3 업로드 실패")
     
+    print(f"✅ S3 업로드 성공: {image_url}")
+
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        # DB 저장 (AI 관련 필드 제거됨)
         nfc_uuid = f"nfc_{uuid.uuid4().hex[:8]}"
-        sql = """
-            INSERT INTO artworks (exhibition_id, title, artist_name, genre, description, price, image_url, nfc_uuid) 
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        """
-        cursor.execute(sql, (ex_id, title, artist, genre, description, price, image_url, nfc_uuid))
+        sql = "INSERT INTO artworks (exhibition_id, title, artist_name, description, price, image_url, nfc_uuid) VALUES (%s, %s, %s, %s, %s, %s, %s)"
+        cursor.execute(sql, (ex_id, title, artist, description, price, image_url, nfc_uuid))
         conn.commit()
         print("✅ DB 저장 성공!")
         return {"message": "저장 성공", "artwork_id": cursor.lastrowid}
     except Exception as e:
-        print(f"❌ DB 에러: {e}")
+        print(f"❌ DB 에러 발생: {e}") # 여기서 에러 내용이 Render 로그에 찍힙니다.
         raise HTTPException(500, f"DB 에러: {str(e)}")
+    finally:
+        cursor.close(); conn.close()
+
+def _db_column_exists(conn, table_name: str, column_name: str) -> bool:
+    """
+    MySQL 테이블의 컬럼 존재 여부를 확인합니다.
+    (스키마 변경 없이, 런타임 fallback에 사용)
+    """
+    db_name = os.getenv("DB_NAME")
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s
+            """,
+            (db_name, table_name, column_name),
+        )
+        row = cursor.fetchone()
+        return bool(row and row.get("cnt", 0) > 0)
+    finally:
+        cursor.close()
+
+# --- [Admin] 공식 작품 수정 (PUT) ---
+@app.put("/admin/artworks/{artwork_id}")
+async def update_artwork(
+    artwork_id: int,
+    title: Optional[str] = Form(None),
+    artist: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    price: Optional[int] = Form(None),
+    genre: Optional[str] = Form(None),  # 프론트에서 보내는 필드(테이블에 없을 수 있음)
+    image: Optional[UploadFile] = File(None),
+):
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        cursor.execute("SELECT * FROM artworks WHERE id = %s", (artwork_id,))
+        existing = cursor.fetchone()
+        if not existing:
+            raise HTTPException(404, "작품을 찾을 수 없습니다.")
+
+        updates = []
+        params = []
+
+        if title is not None:
+            updates.append("title = %s")
+            params.append(title)
+
+        if artist is not None:
+            updates.append("artist_name = %s")
+            params.append(artist)
+
+        if description is not None:
+            updates.append("description = %s")
+            params.append(description)
+
+        if price is not None:
+            updates.append("price = %s")
+            params.append(price)
+
+        # genre 컬럼이 실제로 존재하면 업데이트(없으면 무시)
+        if genre is not None and _db_column_exists(conn, "artworks", "genre"):
+            updates.append("genre = %s")
+            params.append(genre)
+
+        if image is not None:
+            new_image_url = upload_file_to_s3(image)
+            if not new_image_url:
+                raise HTTPException(500, "S3 업로드 실패")
+            updates.append("image_url = %s")
+            params.append(new_image_url)
+
+        if not updates:
+            return {"message": "변경 사항이 없습니다.", "artwork_id": artwork_id}
+
+        sql = f"UPDATE artworks SET {', '.join(updates)} WHERE id = %s"
+        params.append(artwork_id)
+
+        cursor2 = conn.cursor()
+        cursor2.execute(sql, tuple(params))
+        conn.commit()
+        cursor2.close()
+
+        return {"message": "작품 정보가 수정되었습니다.", "artwork_id": artwork_id}
     finally:
         cursor.close(); conn.close()
 
@@ -504,9 +892,14 @@ def get_purchase_requests():
         for row in rows:
             name = row['exhibition_name']
             if name not in grouped_data: grouped_data[name] = []
-            grouped_data[name].append(row)
+            # 프론트 호환 alias 추가 (기존 키 유지 + 새 키 추가)
+            normalized = dict(row)
+            normalized["id"] = row.get("request_id")
+            normalized["price"] = row.get("requested_price")
+            grouped_data[name].append(normalized)
         
-        return [{"exhibition": k, "data": v} for k, v in grouped_data.items()]
+        # 하위호환: 기존 `data` 유지 + 프론트가 쓰는 `requests`도 함께 제공
+        return [{"exhibition": k, "data": v, "requests": v} for k, v in grouped_data.items()]
     finally: cursor.close(); conn.close()
 
 # 구매 요청 승인/거절 처리
@@ -531,54 +924,38 @@ def get_exhibition_artworks(ex_id: int):
         cursor.execute(sql, (ex_id,))
         return cursor.fetchall()
     finally: cursor.close(); conn.close()
-        
-# 5. 작품 수정 (이미지 변경 없으면 기존 유지)
-@app.put("/admin/artworks/{art_id}")
-async def update_artwork(
-    art_id: int,
-    title: str = Form(...),
-    artist: str = Form(...),
-    genre: str = Form(...),
-    description: str = Form(""),
-    # 이미지는 없을 수도 있음 (None 허용)
-    image: UploadFile = File(None) 
-):
-    print(f"🔄 작품 수정 요청 ID: {art_id}, 제목: {title}")
 
+# --- [Admin] 전시회별 Top3 통계 ---
+@app.get("/admin/exhibitions/{ex_id}/top3")
+def get_exhibition_top3(ex_id: int):
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
-
     try:
-        # 1. 기존 이미지 URL 가져오기
-        cursor.execute("SELECT image_url FROM artworks WHERE id = %s", (art_id,))
-        existing_art = cursor.fetchone()
-        
-        if not existing_art:
-            raise HTTPException(404, "작품을 찾을 수 없습니다.")
+        # 1) posts.artwork_id 컬럼이 있으면 "태깅(방문)" 기준 집계 (우선)
+        if _db_column_exists(conn, "posts", "artwork_id"):
+            sql = """
+                SELECT a.id AS artwork_id, a.title, a.artist_name, COUNT(p.id) AS count
+                FROM posts p
+                JOIN artworks a ON p.artwork_id = a.id
+                WHERE a.exhibition_id = %s
+                GROUP BY a.id
+                ORDER BY count DESC
+                LIMIT 3
+            """
+            cursor.execute(sql, (ex_id,))
+            return {"metric": "posts", "top3": cursor.fetchall()}
 
-        final_image_url = existing_art['image_url']
-
-        # 2. 새 이미지가 왔다면 S3 업로드 후 URL 교체
-        if image:
-            print("📸 새 이미지 업로드 중...")
-            new_url = upload_file_to_s3(image)
-            if new_url:
-                final_image_url = new_url
-
-        # 3. DB 업데이트 (artist -> artist_name 매핑 주의)
+        # 2) fallback: purchase_requests 기반 집계(대체 지표)
         sql = """
-            UPDATE artworks 
-            SET title = %s, artist_name = %s, genre = %s, description = %s, image_url = %s
-            WHERE id = %s
+            SELECT a.id AS artwork_id, a.title, a.artist_name, COUNT(pr.id) AS count
+            FROM artworks a
+            LEFT JOIN purchase_requests pr ON pr.artwork_id = a.id
+            WHERE a.exhibition_id = %s
+            GROUP BY a.id
+            ORDER BY count DESC
+            LIMIT 3
         """
-        cursor.execute(sql, (title, artist, genre, description, final_image_url, art_id))
-        conn.commit()
-        
-        print("✅ 수정 완료")
-        return {"message": "수정되었습니다.", "image_url": final_image_url}
-
-    except Exception as e:
-        print(f"❌ 수정 에러: {e}")
-        raise HTTPException(500, f"에러: {str(e)}")
+        cursor.execute(sql, (ex_id,))
+        return {"metric": "purchase_requests", "top3": cursor.fetchall()}
     finally:
         cursor.close(); conn.close()
