@@ -1054,7 +1054,7 @@ def get_purchase_requests():
         # 어느 전시회의 어떤 작품인지 JOIN을 통해 상세히 가져옵니다.
         sql = """
             SELECT e.title as exhibition_name, pr.id as request_id, a.title as art_title, 
-                   pr.buyer_name, pr.price as requested_price, pr.status
+                   pr.buyer_name, pr.price as requested_price, pr.status, pr.created_at
             FROM purchase_requests pr
             JOIN artworks a ON pr.artwork_id = a.id
             JOIN exhibitions e ON a.exhibition_id = e.id
@@ -1070,8 +1070,18 @@ def get_purchase_requests():
             if name not in grouped_data: grouped_data[name] = []
             # 프론트 호환 alias 추가 (기존 키 유지 + 새 키 추가)
             normalized = dict(row)
-            normalized["id"] = row.get("request_id")
-            normalized["price"] = row.get("requested_price")
+            normalized["id"] = str(row.get("request_id"))
+            # 가격은 프론트 목업과 동일하게 문자열로 전달
+            try:
+                normalized["price"] = f"₩ {int(row.get('requested_price') or 0):,}"
+            except Exception:
+                normalized["price"] = str(row.get("requested_price") or "")
+            normalized["status"] = _normalize_purchase_status(row.get("status") or "pending")
+            created = row.get("created_at")
+            if isinstance(created, datetime):
+                normalized["created_at"] = created.strftime("%Y.%m.%d %H:%M")
+            else:
+                normalized["created_at"] = str(created)
             grouped_data[name].append(normalized)
         
         # 하위호환: 기존 `data` 유지 + 프론트가 쓰는 `requests`도 함께 제공
@@ -1084,10 +1094,12 @@ def update_purchase_status(req_id: int, body: PurchaseStatusUpdate):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
+        # 프론트는 pending/approved/rejected를 쓰므로 DB에도 그 형태로 저장(일관성)
+        next_status = _normalize_purchase_status(body.status)
         sql = "UPDATE purchase_requests SET status = %s WHERE id = %s"
-        cursor.execute(sql, (body.status, req_id))
+        cursor.execute(sql, (next_status, req_id))
         conn.commit()
-        return {"message": f"요청 상태가 {body.status}(으)로 변경되었습니다."}
+        return {"message": f"요청 상태가 {next_status}(으)로 변경되었습니다."}
     finally: cursor.close(); conn.close()
         
 # 특정 전시회에 등록된 모든 작품 목록 가져오기
