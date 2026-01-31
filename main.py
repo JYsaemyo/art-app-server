@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import secrets
 from datetime import datetime, timedelta
+from datetime import date as date_type
 
 # 1. 환경 변수 로드
 load_dotenv()
@@ -90,11 +91,29 @@ def load_image_from_url(url):
     except Exception: return None
 
 def get_db_connection():
-    return mysql.connector.connect(
-        host=os.getenv("DB_HOST"), port=os.getenv("DB_PORT"),
-        user=os.getenv("DB_USER"), password=os.getenv("DB_PASSWORD"),
-        database=os.getenv("DB_NAME")
-    )
+    host = os.getenv("DB_HOST")
+    port = int(os.getenv("DB_PORT", "3306"))
+    user = os.getenv("DB_USER")
+    password = os.getenv("DB_PASSWORD")
+    database = os.getenv("DB_NAME")
+
+    db_ssl = (os.getenv("DB_SSL", "") or "").strip().lower() in ("1", "true", "yes", "y")
+
+    kwargs = {
+        "host": host,
+        "port": port,
+        "user": user,
+        "password": password,
+        "database": database,
+    }
+
+    # TiDB Cloud 등에서 TLS가 강제인 경우가 많아 옵션을 반영합니다.
+    # CA 경로를 따로 주지 않는 환경도 있어, 우선 verify는 끈 형태로 연결합니다.
+    if db_ssl:
+        kwargs["ssl_disabled"] = False
+        kwargs["ssl_verify_cert"] = False
+
+    return mysql.connector.connect(**kwargs)
 
 # --- [추가] Admin Auth Helpers ---
 
@@ -178,6 +197,65 @@ def ensure_admin_auth_tables():
     finally:
         cursor.close()
         conn.close()
+
+def ensure_admin_demo_tables():
+    """
+    통계/알림용 테이블을 안전하게 준비합니다.
+    (CREATE TABLE IF NOT EXISTS 만 사용)
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS exhibition_daily_usage (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                exhibition_id INT NOT NULL,
+                date DATE NOT NULL,
+                count INT NOT NULL DEFAULT 0,
+                UNIQUE KEY uniq_exhibition_date (exhibition_id, date),
+                INDEX idx_exhibition_date (exhibition_id, date)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admin_purchase_alerts (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                exhibition_id INT NOT NULL,
+                art_title VARCHAR(255) NOT NULL,
+                buyer_name VARCHAR(255) NOT NULL,
+                price INT NOT NULL DEFAULT 0,
+                status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_alerts_exhibition (exhibition_id),
+                INDEX idx_alerts_status_created (status, created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """
+        )
+        conn.commit()
+        print("✅ [Demo] exhibition_daily_usage/admin_purchase_alerts 테이블 준비 완료")
+    finally:
+        cursor.close()
+        conn.close()
+
+def _normalize_purchase_status(value: str) -> str:
+    """
+    DB status 값을 프론트(StatusBadge)에서 쓰는 소문자 형태로 통일합니다.
+    """
+    s = (value or "").strip().lower()
+    if s in ("approved", "accept", "accepted", "ok", "y", "yes"):
+        return "approved"
+    if s in ("rejected", "reject", "denied", "no", "n"):
+        return "rejected"
+    if s in ("pending", "wait", "waiting"):
+        return "pending"
+    # 기존 백엔드에서 사용하던 형태(APPROVED/REJECTED)도 처리
+    if s == "approved":
+        return "approved"
+    if s == "rejected":
+        return "rejected"
+    return "pending"
 
 def _get_bearer_token(authorization: Optional[str]) -> str:
     if not authorization:
@@ -603,6 +681,10 @@ async def on_startup():
     except Exception as e:
         # auth 테이블 준비 실패가 기존 기능까지 죽이지 않도록 보호
         print(f"⚠️ [Auth] 테이블 준비 실패: {e}")
+    try:
+        ensure_admin_demo_tables()
+    except Exception as e:
+        print(f"⚠️ [Demo] 테이블 준비 실패: {e}")
     asyncio.create_task(periodic_sync_task())
 
 
@@ -648,7 +730,12 @@ def get_admin_exhibitions():
     try:
         # 전시회 제목과 posts 테이블의 제목을 매칭하여 '전체 태그' 수를 실시간 집계합니다.
         sql = """
-            SELECT e.*, COUNT(p.id) as total_tags 
+            SELECT
+                e.*,
+                COALESCE(
+                    (SELECT SUM(u.count) FROM exhibition_daily_usage u WHERE u.exhibition_id = e.id),
+                    COUNT(p.id)
+                ) as total_tags
             FROM exhibitions e 
             LEFT JOIN posts p ON p.title = e.title 
             GROUP BY e.id ORDER BY e.id DESC
@@ -731,16 +818,105 @@ def get_exhibition_analytics(ex_id: int):
         cursor.execute("SELECT title FROM exhibitions WHERE id = %s", (ex_id,))
         ex = cursor.fetchone()
         if not ex: raise HTTPException(404, "전시회를 찾을 수 없습니다.")
-        
-        # 최근 7일간의 날짜별 태깅(방문) 추이를 가져옵니다.
+
+        # 1) ✅ DB에 직접 저장된 "전시회 일별 이용추이"가 있으면 그걸 우선 사용
+        try:
+            start_date = (datetime.utcnow().date() - timedelta(days=6)).strftime("%Y-%m-%d")
+            cursor.execute(
+                """
+                SELECT date, count
+                FROM exhibition_daily_usage
+                WHERE exhibition_id = %s
+                  AND date >= %s
+                ORDER BY date ASC
+                LIMIT 7
+                """,
+                (ex_id, start_date),
+            )
+            rows = cursor.fetchall() or []
+            if rows:
+                out = []
+                for r in rows:
+                    d = r.get("date")
+                    if isinstance(d, (datetime, date_type)):
+                        d_str = d.strftime("%Y-%m-%d")
+                    else:
+                        d_str = str(d)
+                    out.append({"date": d_str, "count": int(r.get("count") or 0)})
+                return {"title": ex["title"], "daily_stats": out, "source": "exhibition_daily_usage"}
+        except Exception:
+            pass
+
+        # 2) fallback: posts 기반 (기존 로직)
         sql = """
             SELECT DATE(created_at) as date, COUNT(*) as count 
             FROM posts WHERE title = %s 
             GROUP BY DATE(created_at) ORDER BY date ASC LIMIT 7
         """
         cursor.execute(sql, (ex['title'],))
-        return {"title": ex['title'], "daily_stats": cursor.fetchall()}
+        return {"title": ex['title'], "daily_stats": cursor.fetchall(), "source": "posts"}
     finally: cursor.close(); conn.close()
+
+@app.get("/admin/purchase-alerts")
+def get_admin_purchase_alerts(status: Optional[str] = None, limit: int = 50):
+    """
+    My Page에서 쓰는 "구매 희망 알림"용 API.
+    DB에 넣어둔 목업/현실 데이터(admin_purchase_alerts)를 전시회 제목과 함께 반환합니다.
+    """
+    limit = max(1, min(int(limit or 50), 200))
+    st = (status or "").strip().lower() if status else None
+
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    try:
+        if st:
+            cursor.execute(
+                """
+                SELECT a.id, e.title AS exhibition, a.art_title, a.buyer_name, a.price, a.status, a.created_at
+                FROM admin_purchase_alerts a
+                JOIN exhibitions e ON e.id = a.exhibition_id
+                WHERE LOWER(a.status) = %s
+                ORDER BY a.created_at DESC
+                LIMIT %s
+                """,
+                (st, limit),
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT a.id, e.title AS exhibition, a.art_title, a.buyer_name, a.price, a.status, a.created_at
+                FROM admin_purchase_alerts a
+                JOIN exhibitions e ON e.id = a.exhibition_id
+                ORDER BY a.created_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+
+        rows = cursor.fetchall() or []
+        out = []
+        for r in rows:
+            created = r.get("created_at")
+            if isinstance(created, datetime):
+                created_str = created.strftime("%Y.%m.%d %H:%M")
+            else:
+                created_str = str(created)
+
+            out.append(
+                {
+                    "id": str(r.get("id")),
+                    "exhibition": r.get("exhibition") or "",
+                    "art_title": r.get("art_title") or "작품",
+                    "buyer_name": r.get("buyer_name") or "",
+                    "price": f"₩ {int(r.get('price') or 0):,}",
+                    "status": _normalize_purchase_status(r.get("status") or "pending"),
+                    "created_at": created_str,
+                }
+            )
+        return {"alerts": out}
+    finally:
+        cursor.close()
+        conn.close()
 
 
 # --- 🚀 [Admin] 2. 공식 작품 등록 섹션 (NFC 매칭용) ---
