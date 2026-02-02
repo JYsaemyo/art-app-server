@@ -1147,3 +1147,51 @@ def get_exhibition_top3(ex_id: int):
         return {"metric": "purchase_requests", "top3": cursor.fetchall()}
     finally:
         cursor.close(); conn.close()
+# ==========================================
+# 🚀 [User] 사용자 앱 전용 API (NFC 태깅)
+# ==========================================
+
+@app.get("/users/artworks/nfc/{nfc_uuid}")
+def get_artwork_by_nfc(nfc_uuid: str):
+    print(f"📡 NFC 태그 스캔 감지: {nfc_uuid}")
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    
+    try:
+        # 작품(a) 정보와 전시회(e) 정보를 JOIN해서 한 번에 가져오는 쿼리
+        sql = """
+            SELECT 
+                a.id as artwork_id, 
+                a.title, 
+                a.artist_name, 
+                a.genre, 
+                a.style,
+                a.price,
+                a.image_url, 
+                a.description as art_description,  -- 작가의 설명 (AI 대신 표시될 내용)
+                
+                e.title as exhibition_title,       -- 전시회 제목
+                e.date as exhibition_date,         -- 전시 기간
+                e.location as exhibition_location  -- 전시 장소
+            FROM artworks a
+            JOIN exhibitions e ON a.exhibition_id = e.id
+            WHERE a.nfc_uuid = %s
+        """
+        cursor.execute(sql, (nfc_uuid,))
+        result = cursor.fetchone()
+        
+        if not result:
+            print("❌ 해당 NFC ID를 가진 작품이 없습니다.")
+            raise HTTPException(status_code=404, detail="작품을 찾을 수 없습니다.")
+            
+        print("✅ 데이터 조회 성공, 앱으로 전송합니다.")
+        return result
+
+    except Exception as e:
+        print(f"🔥 서버 에러: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+        
+    finally:
+        cursor.close()
+        conn.close()
